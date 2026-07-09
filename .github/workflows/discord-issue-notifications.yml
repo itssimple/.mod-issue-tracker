@@ -1,0 +1,119 @@
+name: Discord issue notifications
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  notify:
+    name: Notify Discord
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+    steps:
+      # The secrets context is not available in job-level `if`, so the guard
+      # lives on the step: no DISCORD_WEBHOOK_URL secret -> step is skipped
+      # and the workflow still succeeds.
+      - name: Send Discord embed
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const repo = context.payload.repository;
+
+            // Discord embed limits: title 256, description 4096, field value 1024,
+            // footer 2048, total across the embed 6000 characters.
+            const truncate = (text, max) =>
+              text.length > max ? `${text.slice(0, max - 1)}…` : text;
+
+            // Strip HTML comments left behind by issue templates and collapse
+            // excessive blank lines so the embed stays compact.
+            const cleanBody = (issue.body ?? '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/\r\n/g, '\n')
+              .replace(/\n{3,}/g, '\n\n')
+              .trim();
+
+            // Color-code the embed by the most significant label.
+            const labelNames = issue.labels.map(label => label.name);
+            const COLORS = {
+              bug: 0xe74c3c,         // red
+              enhancement: 0x2ecc71, // green
+              question: 0xf1c40f,    // yellow
+              triage: 0xe67e22,      // orange
+            };
+            const color =
+              COLORS[labelNames.find(name => name in COLORS)] ?? 0x5865f2; // Discord blurple
+
+            const fields = [];
+            if (labelNames.length > 0) {
+              fields.push({
+                name: '🏷️ Labels',
+                value: truncate(labelNames.map(name => `\`${name}\``).join(' '), 1024),
+                inline: true,
+              });
+            }
+            if (issue.milestone) {
+              fields.push({
+                name: '🎯 Milestone',
+                value: truncate(issue.milestone.title, 1024),
+                inline: true,
+              });
+            }
+            if (issue.assignees.length > 0) {
+              fields.push({
+                name: '👤 Assignees',
+                value: truncate(
+                  issue.assignees
+                    .map(user => `[${user.login}](${user.html_url})`)
+                    .join(', '),
+                  1024,
+                ),
+                inline: true,
+              });
+            }
+
+            const payload = {
+              username: 'GitHub Issues',
+              avatar_url: 'https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png',
+              content: `📬 New issue opened in **${repo.full_name}**`,
+              // Never let issue content ping @everyone/roles/users in Discord.
+              allowed_mentions: { parse: [] },
+              embeds: [
+                {
+                  title: truncate(`#${issue.number} ${issue.title}`, 256),
+                  url: issue.html_url,
+                  description: cleanBody
+                    ? truncate(cleanBody, 3000)
+                    : '_No description provided._',
+                  color,
+                  author: {
+                    name: issue.user.login,
+                    url: issue.user.html_url,
+                    icon_url: issue.user.avatar_url,
+                  },
+                  fields,
+                  footer: {
+                    text: repo.full_name,
+                    icon_url: repo.owner.avatar_url,
+                  },
+                  timestamp: issue.created_at,
+                },
+              ],
+            };
+
+            const response = await fetch(process.env.DISCORD_WEBHOOK_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            if (!response.ok) {
+              const body = await response.text();
+              throw new Error(`Discord webhook returned ${response.status}: ${body}`);
+            }
+            core.info(`Discord notification sent for issue #${issue.number}`);
